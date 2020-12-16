@@ -3,15 +3,17 @@ package memdtool
 import (
 	"bufio"
 	"fmt"
+	"github.com/pkg/errors"
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/pkg/errors"
+	"sync"
+	"time"
 )
 
 const (
@@ -23,6 +25,11 @@ const (
 // CLI is struct for command line tool
 type CLI struct {
 	OutStream, ErrStream io.Writer
+}
+
+type MemKeyExp struct {
+	Key string
+	Exp int64
 }
 
 var helpReg = regexp.MustCompile(`^--?h(?:elp)?$`)
@@ -53,18 +60,33 @@ func (cli *CLI) Run(argv []string) int {
 	if strings.Contains(addr, "/") {
 		proto = "unix"
 	}
-	conn, err := net.Dial(proto, addr)
-	if err != nil {
-		log.Println(err.Error())
-		return exitCodeErr
-	}
-	defer conn.Close()
 
 	switch mode {
 	case "display":
+		// create conn
+		conn, connErr := net.Dial(proto, addr)
+		if connErr != nil {
+			log.Println(connErr.Error())
+			return exitCodeErr
+		}
+		defer conn.Close()
 		return cli.display(conn)
 	case "dump":
-		return cli.dump(conn)
+		// create keyConn
+		keyConn, keyConnErr := net.Dial(proto, addr)
+		if keyConnErr != nil {
+			log.Println(keyConnErr.Error())
+			return exitCodeErr
+		}
+		defer keyConn.Close()
+		// create valConn
+		valConn, valConnErr := net.Dial(proto, addr)
+		if valConnErr != nil {
+			log.Println(valConnErr.Error())
+			return exitCodeErr
+		}
+		defer valConn.Close()
+		return cli.dump(keyConn, valConn)
 	}
 	return exitCodeErr
 }
@@ -105,102 +127,184 @@ func (cli *CLI) display(conn io.ReadWriter) int {
 	return exitCodeOK
 }
 
-func (cli *CLI) dump(conn io.ReadWriter) int {
-	fmt.Fprint(conn, "stats items\r\n")
-	slabItems := make(map[string]uint64)
-	rdr := bufio.NewReader(conn)
-	for {
-		lineBytes, _, err := rdr.ReadLine()
-		if err != nil {
-			log.Println(err.Error())
-			return exitCodeErr
-		}
-		line := string(lineBytes)
-		if line == "END" {
+func (cli *CLI) watchErr(errChan chan int, finChan chan struct{}) {
+	ecode := <-errChan
+	close(finChan)
+	cli.setErr(ecode, errChan)
+}
+
+func (cli *CLI) setErr(errCode int, errChan chan int) {
+	select {
+	case errChan <- errCode:
+		/* ignore */
+	default:
+		/* ignore */
+	}
+}
+
+func (cli *CLI) isClosedFinChan(finChan chan struct{}) bool {
+	select {
+	case <-finChan:
+		return true
+	default:
+		return false
+	}
+}
+
+func (cli *CLI) closeFinChan(finChan chan struct{}) {
+	if !cli.isClosedFinChan(finChan) {
+		close(finChan)
+	}
+}
+
+func (cli *CLI) getKeys(conn io.ReadWriter, keyChan chan MemKeyExp, errChan chan int, finChan chan struct{}, wg *sync.WaitGroup) {
+	// close finChan
+	// done waitgroup
+	defer func(finChan chan struct{}, wg *sync.WaitGroup) {
+		cli.closeFinChan(finChan)
+		wg.Done()
+	}(finChan, wg)
+
+	// get keys
+	rdr, isBusy := bufio.NewReader(conn), true
+	for isBusy {
+		if cli.isClosedFinChan(finChan) {
 			break
 		}
-		// ex. STAT items:1:number 1
-		if !strings.Contains(line, ":number ") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) != 3 {
-			log.Printf("result of `stats items` is strange: %s\n", line)
-			return exitCodeErr
-		}
-		fields2 := strings.Split(fields[1], ":")
-		if len(fields2) != 3 {
-			log.Printf("result of `stats items` is strange: %s\n", line)
-			return exitCodeErr
-		}
-		value, _ := strconv.ParseUint(fields[2], 10, 64)
-		slabItems[fields2[1]] = value
-	}
-
-	var totalItems uint64
-	for _, v := range slabItems {
-		totalItems += v
-	}
-	fmt.Fprintf(cli.ErrStream, "Dumping memcache contents\n")
-	fmt.Fprintf(cli.ErrStream, "  Number of buckets: %d\n", len(slabItems))
-	fmt.Fprintf(cli.ErrStream, "  Number of items  : %d\n", totalItems)
-
-	for k, v := range slabItems {
-		fmt.Fprintf(cli.ErrStream, "Dumping bucket %s - %d total items\n", k, v)
-
-		keyexp := make(map[string]string, int(v))
-		fmt.Fprintf(conn, "stats cachedump %s %d\r\n", k, v)
+		// get all keys from lru_crawler metadump all
+		fmt.Fprint(conn, "lru_crawler metadump all\r\n")
 		for {
-			lineBytes, _, err := rdr.ReadLine()
-			if err != nil {
-				log.Println(err.Error())
-				return exitCodeErr
+			if cli.isClosedFinChan(finChan) {
+				break
+			}
+			lineBytes, _, lineBytesErr := rdr.ReadLine()
+			if lineBytesErr != nil {
+				log.Printf(lineBytesErr.Error())
+				cli.setErr(exitCodeErr, errChan)
+				return
+			}
+			line := string(lineBytes)
+			if strings.HasPrefix(line, "BUSY currently processing crawler request") {
+				log.Printf("BUSY currently processing crawler request wait 5sec")
+				time.Sleep(time.Duration(5) * time.Second)
+				break
+			} else if isBusy {
+				log.Printf("lru_crawler dump start")
+				isBusy = false
+			}
+			if line == "END" {
+				break
+			}
+			if !strings.Contains(line, "key=") {
+				continue
+			}
+			// [format]
+			// key=UID%3A%3A11%3A%3ACAESEHQTlN-G6eC5F1E7i4JFC_s exp=1610365183 la=1607674998 cas=2522 fetch=yes
+			arr1 := strings.Split(line, " ")
+			if len(arr1) < 2 || arr1[0] == "" || arr1[1] == "" {
+				continue
+			}
+			keyval1 := strings.Split(arr1[0], "=")
+			if len(keyval1) < 2 || keyval1[1] == "" {
+				continue
+			}
+			keyval2 := strings.Split(arr1[1], "=")
+			if len(keyval2) < 2 || keyval2[1] == "" {
+				continue
+			}
+			exp64, exp64_err := strconv.ParseInt(keyval2[1], 10, 64)
+			if exp64_err != nil {
+				continue
+			}
+			decoded_key, _ := url.QueryUnescape(keyval1[1])
+			if time.Now().Unix() > exp64 {
+				continue
+			}
+			keyChan <- MemKeyExp{Key: decoded_key, Exp: exp64}
+		}
+	}
+}
+
+func (cli *CLI) dumpData(conn io.ReadWriter, keyChan chan MemKeyExp, errChan chan int, finChan chan struct{}, wg *sync.WaitGroup) {
+	// done waitgroup
+	defer func(wg *sync.WaitGroup) {
+		wg.Done()
+	}(wg)
+
+	// get key-value pairs
+	rdr := bufio.NewReader(conn)
+	for {
+		// finish dump
+		if cli.isClosedFinChan(finChan) && len(keyChan) == 0 {
+			break
+		}
+		// get key from keyChan
+		keyExp := <-keyChan
+		cachekey, exp := keyExp.Key, keyExp.Exp
+		fmt.Fprintf(conn, "get %s\r\n", cachekey)
+		for {
+			lineBytes, _, lineBytesErr := rdr.ReadLine()
+			if lineBytesErr != nil {
+				log.Println(lineBytesErr.Error())
+				cli.setErr(exitCodeErr, errChan)
+				return
 			}
 			line := string(lineBytes)
 			if line == "END" {
 				break
 			}
-			// return format like this
-			// ITEM piyo [1 b; 1483953061 s]
+			// VALUE hoge 0 6
+			// hogege
 			fields := strings.Fields(line)
-			if len(fields) == 6 && fields[0] == "ITEM" {
-				keyexp[fields[1]] = fields[4]
+			if len(fields) != 4 || fields[0] != "VALUE" {
+				continue
 			}
-		}
-
-		for cachekey, exp := range keyexp {
-			fmt.Fprintf(conn, "get %s\r\n", cachekey)
-			for {
-				lineBytes, _, err := rdr.ReadLine()
-				if err != nil {
-					log.Println(err.Error())
-					return exitCodeErr
-				}
-				line := string(lineBytes)
-				if line == "END" {
-					break
-				}
-				// VALUE hoge 0 6
-				// hogege
-				fields := strings.Fields(line)
-				if len(fields) != 4 || fields[0] != "VALUE" {
-					continue
-				}
-				flags := fields[2]
-				sizeStr := fields[3]
-				size, _ := strconv.Atoi(sizeStr)
-				buf := make([]byte, size)
-				_, err = rdr.Read(buf)
-				if err != nil {
-					log.Println(err.Error())
-					return exitCodeErr
-				}
-				fmt.Fprintf(cli.OutStream, "add %s %s %s %s\r\n%s\r\n", cachekey, flags, exp, sizeStr, string(buf))
-				rdr.ReadLine()
+			flags := fields[2]
+			sizeStr := fields[3]
+			size, _ := strconv.Atoi(sizeStr)
+			buf := make([]byte, size)
+			_, readErr := rdr.Read(buf)
+			if readErr != nil {
+				log.Println(readErr.Error())
+				cli.setErr(exitCodeErr, errChan)
+				return
 			}
+			fmt.Fprintf(cli.OutStream, "add %s %s %d %s\r\n%s\r\n", cachekey, flags, exp, sizeStr, string(buf))
+			rdr.ReadLine()
 		}
 	}
-	return exitCodeOK
+}
+
+func (cli *CLI) dump(keyConn io.ReadWriter, valConn io.ReadWriter) int {
+	log.Printf("dump start")
+
+	// init channels
+	wg := sync.WaitGroup{}
+	keyChan := make(chan MemKeyExp, 100000)
+	errChan := make(chan int, 1)
+	finChan := make(chan struct{}, 1)
+
+	// watch errors
+	go cli.watchErr(errChan, finChan)
+	// get keys
+	wg.Add(1)
+	go cli.getKeys(keyConn, keyChan, errChan, finChan, &wg)
+	// dump data
+	wg.Add(1)
+	go cli.dumpData(valConn, keyChan, errChan, finChan, &wg)
+
+	// wait
+	<-finChan
+	wg.Wait()
+	log.Printf("dump finished.")
+
+	// return exit code
+	select {
+	case ecode := <-errChan:
+		return ecode
+	default:
+		return exitCodeOK
+	}
 }
 
 func printHelp(w io.Writer) {

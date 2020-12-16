@@ -1,9 +1,8 @@
 package main
 
 import (
+	"github.com/starballerina310/go-memcached-tool"
 	"os"
-
-	"github.com/Songmu/go-memcached-tool"
 )
 
 func main() {

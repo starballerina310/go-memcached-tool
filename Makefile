@@ -1,5 +1,5 @@
 CURRENT_REVISION = $(shell git rev-parse --short HEAD)
-BUILD_LDFLAGS = "-X github.com/Songmu/go-memcached-tool.revision=$(CURRENT_REVISION)"
+BUILD_LDFLAGS = "-X github.com/starballerina310/go-memcached-tool.revision=$(CURRENT_REVISION)"
 ifdef update
   u=-u
 endif

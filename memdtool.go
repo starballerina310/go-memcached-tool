@@ -64,34 +64,35 @@ func (cli *CLI) Run(argv []string) int {
 	switch mode {
 	case "display":
 		// create conn
-		conn, connErr := net.Dial(proto, addr)
+		conn, connErr := cli.dialer(proto, addr)()
 		if connErr != nil {
 			log.Println(connErr.Error())
 			return exitCodeErr
 		}
-		defer conn.Close()
 		return cli.display(conn)
 	case "dump":
 		// create keyConn
-		keyConn, keyConnErr := net.Dial(proto, addr)
+		keyConn, keyConnErr := cli.dialer(proto, addr)()
 		if keyConnErr != nil {
 			log.Println(keyConnErr.Error())
 			return exitCodeErr
 		}
-		defer keyConn.Close()
 		// create valConn
-		valConn, valConnErr := net.Dial(proto, addr)
+		valConn, valConnErr := cli.dialer(proto, addr)()
 		if valConnErr != nil {
 			log.Println(valConnErr.Error())
 			return exitCodeErr
 		}
-		defer valConn.Close()
-		return cli.dump(keyConn, valConn)
+		return cli.dump(keyConn, valConn, cli.dialer(proto, addr))
 	}
 	return exitCodeErr
 }
 
-func (cli *CLI) display(conn io.ReadWriter) int {
+func (cli *CLI) display(conn net.Conn) int {
+
+	curConn := conn
+	defer curConn.Close()
+
 	items, err := GetSlabStats(conn)
 	if err != nil {
 		log.Println(err.Error())
@@ -157,7 +158,36 @@ func (cli *CLI) closeFinChan(finChan chan struct{}) {
 	}
 }
 
-func (cli *CLI) getKeys(conn io.ReadWriter, keyChan chan MemKeyExp, errChan chan int, finChan chan struct{}, wg *sync.WaitGroup) {
+func (cli *CLI) dialer(proto string, addr string) func() (net.Conn, error) {
+	return func() (net.Conn, error) {
+		// get connection
+		nc, err := net.Dial(proto, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		// set keep-alive
+		if _, ok := nc.(*net.TCPConn); ok {
+			err = nc.(*net.TCPConn).SetKeepAlive(true)
+			if err != nil {
+				nc.Close()
+				return nil, err
+			}
+			err = nc.(*net.TCPConn).SetKeepAlivePeriod(time.Duration(10) * time.Second)
+			if err != nil {
+				nc.Close()
+				return nil, err
+			}
+		}
+		return nc, nil
+	}
+}
+
+func (cli *CLI) getKeys(conn net.Conn, keyChan chan MemKeyExp, errChan chan int, finChan chan struct{}, wg *sync.WaitGroup) {
+
+	curConn := conn
+	defer curConn.Close()
+
 	// close finChan
 	// done waitgroup
 	defer func(finChan chan struct{}, wg *sync.WaitGroup) {
@@ -165,18 +195,36 @@ func (cli *CLI) getKeys(conn io.ReadWriter, keyChan chan MemKeyExp, errChan chan
 		wg.Done()
 	}(finChan, wg)
 
+	// get total number of items
+	items, itemsErr := GetSlabStats(conn)
+	if itemsErr != nil {
+		log.Println(itemsErr.Error())
+		cli.setErr(exitCodeErr, errChan)
+		return
+	}
+	var itemCnt, itemLimit uint64
+	for _, item := range items {
+		itemLimit += item.Number
+	}
+
 	// get keys
-	rdr, isBusy := bufio.NewReader(conn), true
+	rdr, wtr, isBusy := bufio.NewReader(conn), bufio.NewWriter(conn), true
 	for isBusy {
-		if cli.isClosedFinChan(finChan) {
+		// check limit
+		if cli.isClosedFinChan(finChan) || (itemCnt >= itemLimit) {
 			break
 		}
+
 		// get all keys from lru_crawler metadump all
-		fmt.Fprint(conn, "lru_crawler metadump all\r\n")
+		fmt.Fprint(wtr, "lru_crawler metadump all\r\n")
+		wtr.Flush()
 		for {
-			if cli.isClosedFinChan(finChan) {
+			// check limit
+			if cli.isClosedFinChan(finChan) || (itemCnt >= itemLimit) {
 				break
 			}
+
+			// get line
 			lineBytes, _, lineBytesErr := rdr.ReadLine()
 			if lineBytesErr != nil {
 				log.Printf(lineBytesErr.Error())
@@ -198,6 +246,7 @@ func (cli *CLI) getKeys(conn io.ReadWriter, keyChan chan MemKeyExp, errChan chan
 			if !strings.Contains(line, "key=") {
 				continue
 			}
+
 			// [format]
 			// key=UID%3A%3A11%3A%3ACAESEHQTlN-G6eC5F1E7i4JFC_s exp=1610365183 la=1607674998 cas=2522 fetch=yes
 			arr1 := strings.Split(line, " ")
@@ -218,14 +267,20 @@ func (cli *CLI) getKeys(conn io.ReadWriter, keyChan chan MemKeyExp, errChan chan
 			}
 			decoded_key, _ := url.QueryUnescape(keyval1[1])
 			if time.Now().Unix() > exp64 {
+				log.Printf("expired=%s", decoded_key)
 				continue
 			}
 			keyChan <- MemKeyExp{Key: decoded_key, Exp: exp64}
+			itemCnt++
 		}
 	}
 }
 
-func (cli *CLI) dumpData(conn io.ReadWriter, keyChan chan MemKeyExp, errChan chan int, finChan chan struct{}, wg *sync.WaitGroup) {
+func (cli *CLI) dumpData(conn net.Conn, keyChan chan MemKeyExp, errChan chan int, finChan chan struct{}, wg *sync.WaitGroup) {
+
+	curConn := conn
+	defer curConn.Close()
+
 	// done waitgroup
 	defer func(wg *sync.WaitGroup) {
 		wg.Done()
@@ -233,6 +288,8 @@ func (cli *CLI) dumpData(conn io.ReadWriter, keyChan chan MemKeyExp, errChan cha
 
 	// get key-value pairs
 	rdr := bufio.NewReader(conn)
+	wtrs := bufio.NewWriter(conn)
+	wtro := bufio.NewWriter(cli.OutStream)
 	for {
 		// finish dump
 		if cli.isClosedFinChan(finChan) && len(keyChan) == 0 {
@@ -241,7 +298,8 @@ func (cli *CLI) dumpData(conn io.ReadWriter, keyChan chan MemKeyExp, errChan cha
 		// get key from keyChan
 		keyExp := <-keyChan
 		cachekey, exp := keyExp.Key, keyExp.Exp
-		fmt.Fprintf(conn, "get %s\r\n", cachekey)
+		fmt.Fprintf(wtrs, "get %s\r\n", cachekey)
+		wtrs.Flush()
 		for {
 			lineBytes, _, lineBytesErr := rdr.ReadLine()
 			if lineBytesErr != nil {
@@ -269,13 +327,14 @@ func (cli *CLI) dumpData(conn io.ReadWriter, keyChan chan MemKeyExp, errChan cha
 				cli.setErr(exitCodeErr, errChan)
 				return
 			}
-			fmt.Fprintf(cli.OutStream, "add %s %s %d %s\r\n%s\r\n", cachekey, flags, exp, sizeStr, string(buf))
+			fmt.Fprintf(wtro, "add %s %s %d %s\r\n%s\r\n", cachekey, flags, exp, sizeStr, string(buf))
 			rdr.ReadLine()
 		}
 	}
+	wtro.Flush()
 }
 
-func (cli *CLI) dump(keyConn io.ReadWriter, valConn io.ReadWriter) int {
+func (cli *CLI) dump(keyConn net.Conn, valConn net.Conn, dialer func() (net.Conn, error)) int {
 	log.Printf("dump start")
 
 	// init channels
@@ -338,7 +397,7 @@ type SlabStat struct {
 }
 
 // GetSlabStats takes SlabStats from connection
-func GetSlabStats(conn io.ReadWriter) ([]*SlabStat, error) {
+func GetSlabStats(conn net.Conn) ([]*SlabStat, error) {
 	retMap := make(map[int]*SlabStat)
 	fmt.Fprint(conn, "stats items\r\n")
 	scr := bufio.NewScanner(bufio.NewReader(conn))
